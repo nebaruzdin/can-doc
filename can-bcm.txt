@@ -1,0 +1,425 @@
+============================================================================
+
+can-bcm.txt : Broadcast Manager API
+
+Part of the documentation for the socketCAN subsystem
+
+This file contains:
+
+  B. Broadcast Manager protocol sockets (SOCK_DGRAM)
+    B.1 Opening BCM sockets
+    B.2 BCM messages (struct bcm_msg_head)
+    B.3 TX_SETUP opcode
+      B.3.1 Timer specifics
+      B.3.2 Modification of data at runtime
+      B.3.3 Transmitting different data (multiplexed message datagram)
+    B.4 TX_DELETE opcode
+    B.5 TX_READ opcode
+    B.6 TX_SEND opcode
+    B.7 RX_SETUP opcode
+      B.7.1 Timeout monitoring
+      B.7.2 Reduction of RX_CHANGED messages
+      B.7.3 Message filtering (user data - simple)
+      B.7.4 Message filtering (user data - multiplex)
+      B.7.5 Message filtering (length of user data - DLC)
+    B.8 RX_DELETE opcode
+    B.9 RX_READ opcode
+
+============================================================================
+
+B. Broadcast Manager protocol sockets (SOCK_DGRAM)
+--------------------------------------------------
+
+  The Broadcast Manager (BCM) provides functions to send CAN frames
+  once or periodically, as well as notify applications of changes in
+  received CAN frames, recognizing specific CAN IDs.
+
+  Capabilities on the trasmission side:
+  - Cyclic transmission of a CAN frame with a given interval
+  - Modification of message content and intervals at runtime (e.g.
+    switching to a new interval with or without immediate restart of
+    the timer)
+  - Automatically switching to a second interval after a certain number
+    of frames has been sent
+  - Instant transmission of changed frames, without influencing the
+    interval cycle
+  - One-time transmission of CAN messages
+
+  Capabilities on the receiving side:
+  - Receive filter to detect changes in frame ID, data or length (DLC)
+  - Receive filter for multiplex frames (e.g. with packet counters in
+    the data field)
+  - RTR replies to messages
+  - Time-out monitoring of frames
+  - Frequency reduction of messages (throttle function) to the user
+    application
+
+  B.1 Opening BCM sockets
+
+  To use the referenced definitions for CAN_BCM sockets, include
+  <linux/can/bcm.h>.
+
+  A socket for the Broadcast-Manager is created with:
+
+    s = socket(PF_CAN, SOCK_DGRAM, CAN_BCM);
+
+  The CAN interface is assigned with a call to connect() on the socket.
+
+    addr.can_family = AF_CAN;
+    strcpy(ifr.ifr_name, "can0");
+    ioctl(s, SIOCGIFINDEX, &ifr);
+    addr.can_ifindex = ifr.ifr_ifindex;
+
+    connect(s, (struct sockaddr *)&addr, sizeof(addr));
+
+  If a process must operate on multiple CAN buses, it can open several
+  sockets. It is also possible for a process to open multiple sockets
+  on a single CAN-bus, if it makes sense for the application programmer
+  to structure different data flows.
+  Every single instance of Broadcast-Manager is able to manage any number of
+  filter and/or send requests.
+
+  B.2 BCM messages (struct bcm_msg_head)
+
+  All messages from the (user) process to Broadcast-Manager have the same
+  structure. It consists of a message header with the command (opcode),
+  several options and zero or more CAN frames, depending on the command
+  used and the action requested:
+
+    struct bcm_msg_head {
+        int opcode;                   /* command */
+        int flags;                    /* special flags */
+        int count;                    /* run 'count' times ival1 then ival2 */
+        struct timeval ival1, ival2;  /* intervals */
+        canid_t can_id;               /* 32 Bit SFF/EFF. MSB set at EFF */
+        int nframes;                  /* num of can_frame's in the next field */
+        struct can_frame frames[0];
+    };
+
+  The value of nframes indicates how many user data frames follow the
+  message header. The user data frames are used to describe the actual
+  content of a CAN message:
+
+    struct can_frame {
+        canid_t can_id;      /* 32 bit CAN_ID + EFF/RTR flags */
+        __u8    can_dlc;     /* data length code: 0 .. 8 */
+        __u8    data[8] __attribute__ ((aligned(8)));
+    };
+
+  The opcode defines the type of message. Messages from the user to
+  BCM control the operations of the BCM, replies from the BCM indicate
+  certain changes to the user, such as timeouts, etc.
+
+  The transmit and receive path of the BCM are two independent functional
+  blocks.
+
+  For the transmit path the following opcodes exist:
+
+   TX_SETUP: for setting up and modifying transmission requests
+   TX_DELETE: to remove send requests
+   TX_READ: to read out the current broadcasting commands
+            (for debugging purposes)
+   TX_SEND: for sending a single CAN message
+
+  For the receive path the following opcodes exist:
+
+   RX_SETUP: for setting and modifying receive filters
+   RX_DELETE: for deleting receive filters
+   RX_READ: to read out the current receive filter (for debugging purposes)
+
+  The Broadcast-Manager sends response messages in the same form. The
+  BCM sends these opcodes:
+
+   TX_STATUS: in response to TX_READ
+   TX_EXPIRED: is sent when the counter count reaches ival1 (only if
+               flag TX_COUNTEVT is set, see below)
+
+   RX_STATUS: in response to RX_READ
+   RX_TIMEOUT: sent if the time-controlled reception of a message failed
+   RX_CHANGED: sent if the first or a revised CAN message was received
+
+  Each of these opcode needs CAN ID specified either in the "can_id" field or
+  in the first can_frame structure attached to the command.
+
+  In addition, there are optional flags which can influence the BCM behavior:
+
+   SETTIMER: set the value of ival1, ival2 and count
+   STARTTIMER: start the timer with the actual value of ival1, ival2 and count.
+        Starting the timer leads simultaneously to the transmission of a
+        can_frame
+   TX_COUNTEVT: create the message TX_EXPIRED when count is reached
+   TX_ANNOUNCE: a change of data by the process is emitted with a new frame,
+        regardless of the timer status
+   TX_CP_CAN_ID: copies the can_id from the message header attached to each
+        of can_frame. This is intended only as usage simplification
+   TX_RESET_MULTI_IDX: forces a reset of the index counter from the update
+        to be sent by multiplex message even if it would not be necessary
+        because of the length
+   RX_FILTER_ID: there is no filtering of the user data. A match with the
+        received message can_id automatically leads to a RX_CHANGED. Use
+        caution in cyclic messages. If RX_FILTER_ID flag is set, the CAN frame
+        in RX_SETUP can be ignored (i.e., nframes = 0)
+   RX_RTR_FRAME: the filter passed is used as CAN message to be sent when
+        receiving an RTR frame
+   RX_CHECK_DLC: a change of the DLC leads to an RX_CHANGED message to the user
+        application
+   RX_NO_AUTOTIMER: if the timer ival1 in the RX_SETUP has been set equal to
+        zero, on receipt of the CAN message the timer for the timeout
+        monitoring is automatically started. Setting this flag prevents the
+        automatic reset of the start timer
+   RX_ANNOUNCE_RESUME: refers also to the time-out supervision of RX_SETUP. By
+        setting this flag, when an RX-outs occours, a RX_CHANGED will be
+        generated when the (cyclic) receive restarts. This will happen even
+        if the user data have not changed
+
+  B.3 TX_SETUP opcode
+
+  With TX_SETUP a specific CAN ID for cyclic send is set or changed.
+
+  Typically, it is used with a structure in which the components can_id, flags
+  (SETTIMER, STARTTIMER), count=0, ival2=100ms, nframes=1 are set and the user
+  data in the can_frame structure is filled in accordingly. This variable is then
+  transmitted with the write() system call on the socket to BCM.
+
+  Example:
+
+    struct {
+      struct bcm_msg_head msg_head;
+      struct can_frame frame[4]; /* just an example */
+    } msg;
+
+    msg.msg_head.opcode  = TX_SETUP;
+    msg.msg_head.can_id  = 0x42;
+    msg.msg_head.flags   = SETTIMER|STARTTIMER|TX_CP_CAN_ID;
+    msg.msg_head.nframes = 1;
+    msg.msg_head.count = 0;
+    msg.msg_head.ival1.tv_sec = 0;
+    msg.msg_head.ival1.tv_usec = 0;
+    msg.msg_head.ival2.tv_sec = 0;
+    msg.msg_head.ival2.tv_usec = 100000;
+    msg.frame[0].can_id    = 0x42; /* obsolete when using TX_CP_CAN_ID */
+    msg.frame[0].can_dlc   = 3;
+    msg.frame[0].data[0]   = 0x123;
+    msg.frame[0].data[1]   = 0x312;
+    msg.frame[0].data[2]   = 0x231;
+
+    write(s, &msg, sizeof(msg));
+
+  The message length for the command TX_SETUP is, therefore,
+  [bcm_msg_head] + [can_frame]. I.e. a message header and at least one CAN-Frame.
+
+    1.3.1 Timer specifics
+
+  The timer can be set to 0 ms (ival1 and ival2). In this case, the variable
+  should be transferred with the flag SETTIMER. To start a cyclic send timer
+  with the given values, the flags SETTIMER and STARTTIMER in the element
+  flags have to be set.
+
+  To complement the above example, you can work with two intervals for the
+  cyclical transmission of the CAN message. Here, the CAN message is sent
+  first count times with interval ival1 and then by an explicit deletion
+  with TX\_DELETE or by stopping the timer, with the interval ival2. The
+  interval ival2 may be zero, in which case the transmission after the first
+  count messages stops. If count is zero, the value of ival1 has no role and
+  does not need to be specified.
+
+  If the flag STARTTIMER is set, the first CAN message is sent out immediately.
+
+  It is important to know for the user, when switching the BCM from the interval
+  ival1 to ival2 (the transmission may stop), that the flag TX_COUNTEVT of BCM
+  can be used. When the value count is decremented down to zero, the flag
+  TX_COUNTEVT is set, and BCM sends a message with the opcode TX_EXPIRED to the
+  process. This message contains only a message header (nframes = 0).
+
+    1.3.2 Modification of data at runtime
+
+  At runtime, the data in the CAN message can be changed. The data is
+  modified in the variable and transferred with the opcode TX_SETUP to the BCM.
+  This can generate the following special cases:
+  - The cycle should be restarted: set the flag STARTTIMER
+  - The cycle is to be retained, but the changed / appended data will be sent
+    immediately once: set the flag TX_ANNOUNCE
+  - The cycle should be maintained and the changed data is sent instead of the
+    older one: default behavior
+
+  Note: when restarting the cycle, the last timer values set (ival1, ival2)
+  are not modified by BCM. But if working with two timers, the value of
+  count is decremented for the period by BCM.
+
+    1.3.3 Transmitting different data (multiplexed message datagram)
+
+  The BCM can also send multiplex messages. This is needed if, for example,
+  the first byte of user data contains a value used to look up information in
+  the following seven bytes. Another application is the switching / toggling
+  of data content. To use this, a structure with more than one user data frame
+  after the header must be sent to BCM. As a consequence not a single CAN-ID is
+  sent to BCM, but a number of can_frame. The various user data are sent
+  consecutively in the cycle of transmission. I.e. two can_frame are alternately
+  sent in the desired interval. A change in the data at runtime causes the
+  transmssion of the the first can_frame the update changed. If the number of
+  messages did not change, a reset of the index can be done by setting the
+  flag TX_RESET_MULTI_IDX.
+
+  B.4 TX_DELETE opcode
+
+  This opcode will delete the entry for transmission of the CAN frame with
+  the specified can_id CAN identifier. The message length for the command
+  TX_DELETE is sizeof(bcm_msg_head) (only the header).
+
+  B.5 TX_READ opcode
+
+  With this message, the current state is read for the specified can_id CAN
+  identifier, i.e. CAN message to be sent, counter, timer values, etc. BCM
+  responds with a message with the opcode TX_STATUS that contains the item. The
+  length of this answer can be different from the original TX_SETUP request.
+
+  The message length for the command TX_READ is [bcm_msg_head]
+  (only a message header).
+
+  B.6 TX_SEND opcode
+
+  To send a single CAN message, without using the special functionality of BCM,
+  the TX_SEND opcode is used. In this case one structure is generated in which
+  the components can_id, can_dlc, data[] are filled with the appropriate values.
+  The BCM sends the CAN message directly to the socket defined by the CAN bus. The
+  message length for the command TX_SEND is [bcm_msg_head] [can_frame]
+  (i.e. a message header and exactly one CAN-Frame).
+
+  Note: of course, single CAN message can be sent with the RAW socket. But you
+  would have to open a RAW socket for a single CAN message when you have an already
+  open BCM-Socket. That is a disproportionately large programming effort.
+
+  B.7 RX_SETUP opcode
+
+  RX_SETUP is used to create or change a receive job for a specific CAN ID.
+  The BCM is used to filter such CAN messages according to various criteria, and
+  send a message to the process for changes and/or timeouts.
+
+  Similar to the opcode TX_SETUP (see chapter 1.3), a BCM message structure has
+  to be created. The message length for the command RX_SETUP is 
+  [bcm_msg_head] + [can_frame] (i.e. a message header and at least one CAN-Frame).
+
+  In contrast to TX_SETUP the components of the structure in the context of the
+  receiving functionality have some other meanings when they are sent from the
+  process to the BCM:
+  - count: no function
+  - ival1: timeout for CAN message reception
+  - ival2: reduction of RX_CHANGED messages
+  - can_data: contains a mask to filter user data
+
+    B.7.1 Timeout monitoring
+
+  If the BCM does not receive a CAN message for a longer period than ival1, a
+  message is sent to the process with the opcode RX_TIMEOUT. This message
+  contains only a message header (nframes = 0). A timeout monitoring is not in
+  this case started again.
+
+  Typically, the timeout monitoring starts with the reception of a CAN message.
+  By setting the flag STARTTIMER in the RX_SETUP the timeout is immediately started.
+  Setting the flag RX_NO_AUTOTIMER prevents the automatic start of the surveillance
+  timeout when receiving a CAN message.
+
+  Background: The automatic start of the surveillance timeout when receiving a
+  message makes each occurring cyclic failure of a CAN message clearly, without
+  the user having to do anything.
+
+  To recognize a resumption of the cycle under the same user data securely,
+  the flag RX_ANNOUNCE_RESUME must be set.
+
+    B.7.2 Reduction of RX_CHANGED messages
+
+  Even when the filtering of user data is active, the user application can be
+  overwhelmed by RX_CHANGED messages when the data change rapidly (e.g. speed).
+
+  For this purpose, the timer ival2 can be set. It describes the minimum
+  period in which successive RX_CHANGED messages for each can_id may be sent
+  from the BCM.
+
+  Note: if, during the blocked time, further changed CAN messages are received,
+  the last valid one will be transferred after the lockout with a RX_CHANGED. It
+  can happen that intermittent (e.g. alternating) state transitions are lost.
+
+  Note for MUX messages: after the lockout, all occurring RX_CHANGED messages
+  are sent in succession to the process. I.e. a change for each MUX entry is
+  displayed.
+
+    B.7.3 Message filtering (user data - simple)
+
+  Analogous to the transfer of user data in TX_SETUP (see chapter 1.3),
+  in RX_SETUP a mask can be set to filter the incoming user data. Only the first
+  user data entry (data[]) of the structure can_frame is evaluated by the BCM for
+  message filtering.
+
+  A bit set in the mask in this case means that the corresponding bit in the CAN
+  message must be monitored for a change.
+
+  In a received CAN message, if one change is detected from the last received
+  message in one of the bits specified in the mask, the message RX_CHANGED with
+  the full CAN frame received will be sent to the process.
+  The first time a message is received, the received CAN frame is generally sent
+  to the process - only then it can eventually be tested for changes.
+
+  Tip: by setting the filter mask to zero, the process will receive a unique
+  example of an otherwise cyclical message.
+
+    B.7.4 Message filtering (user data - multiplex)
+
+  If there is a CAN message with a single CAN-ID to be transferred with cyclically
+  repetitive content, it is called a multiplex message. For example a MUX identifier
+  is inserted in the first byte of the payload of the CAN frame, which defines
+  the meaning of the next bytes.
+  Example: if the first byte (byte 0) has the value 0x02 then in the bytes 1-7 the
+  number of Km is available. If, otherwise, in the first byte (byte 0) the value
+  is 0x04, then in the bytes 1-7 the running hours number is registered. And so on.
+
+  Such multiplex messages can managed by BCM by sending more than a user data frame
+  can_frame for a CAN-ID (see section 1.3.3).
+
+  In order to filter multiplex messages, there must be at least two can_frame
+  (nframes == 2) sent to the BCM, where the first can_frame contains the MUX
+  mask and the second can_frame the user data mask, as described above.
+  The points that define the MUX-mask are in the user data masks, they are
+  distinguished by the MUX Identifier in the user data.
+
+  For the example above it would mean:
+
+  The first byte in the first can_frame (the MUX-mask) would be 0xFF - the
+  following 7 bytes would be 0x00 - this is the MUX-mask defined
+  The following two can_frame each contain at least in the first byte the
+  0x02 or 0x04 values so that the identifier of the Multiplex messages are defined.
+  In addition, (reasonably) in the user data other bits are set, which for example
+  correspond to a change in operating hours.
+
+  A change in a multiplex message with a particular MUX identifier results in a
+  message RX_CHANGED to the process with the received CAN Frame. The process
+  must assess the basis of the MUX-Identifiers from the BCM message received.
+
+ 00111111 00000000 00000000 00000000 00000000 00000000 00000000 00000000 MUX mask
+                                                                         can_frame[0]
+ 00000010 11111111 11111111 11111111 11111111 11111111 11111111 11111111 User data mask
+                                                                         can_frame[1]
+ 00000100 00000000 11111111 00000000 11111111 11111111 11111111 11111111 User data mask
+                                                                         can_frame[2]
+
+ 00100000 00100000 00100000 00100000 00100000 00100000 00100000 00100000 RX frame 1
+ 00000100 00000000 00101010 01000000 01100000 00111000 00100000 01100000 RX frame 2
+ 10000100 00100000 00101010 01100000 01100000 00111000 00100000 01100000 RX frame 3
+ -          -                 -
+
+  In the example shown, the MUX-mask in byte 0 is set to 0x5F. When receiving
+  RX-frame no message is sent to the user (MUX-identifier is not known). With
+  RX-frame 2 there is a message (MUX-known identifier and relevant data have
+  changed at the first receive operation). By receiving the RX-Frame 3 (changes
+  in the underlined bits) no message is sent to the user, because no changes
+  are in any relevant data on the registered identifier MUX.
+
+    B.7.5 Message filtering (length of user data - DLC)
+
+  When requested, BCM can additionally monitor a change in the CAN message
+  specified user data. In addition, the received Data Length Code (DLC) can be
+  compared with the reference message. If a difference is detected an RX_CHANGED
+  message is sent to the process.
+  To enable this functionality the flag RX_CHECK_DLC must be set in flags.
+
+  B.8 RX_DELETE opcode
+  B.9 RX_READ opcode
